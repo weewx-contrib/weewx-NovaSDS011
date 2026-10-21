@@ -1,4 +1,5 @@
 # coding: utf-8
+# Modified 2026-10-22 by weewx-packages.
 ##############################################################################################
 #   Nova SDS011 WeeWX 5.1 Service
 #   Query-mode support: adds PM2.5 and PM10 to loop packets
@@ -15,6 +16,8 @@ import logging
 import serial
 import os
 import tempfile
+import math
+import urllib.request
 import weewx
 from weewx.engine import StdService
 from weeutil.weeutil import to_bool
@@ -23,7 +26,7 @@ log = logging.getLogger(__name__)
 
 # --- Version ---
 DRIVER_NAME = "NovaSDS011"
-DRIVER_VERSION = "0.4.0"   # bump this when you make changes
+DRIVER_VERSION = "1.1.0"   # bump this when you make changes
 
 # SDS011 commands
 CMD_MODE = 2
@@ -53,6 +56,13 @@ class NovaSDS011Service(StdService):
         sds_dict = config_dict.get('NovaSDS011', {})
         self.port = sds_dict.get('port', '/dev/ttyUSB0')
         self.timeout = float(sds_dict.get('timeout', 3.0))
+        self.url = sds_dict.get('url')
+        self.http_poll_interval = float(sds_dict.get('http_poll_interval', 60))
+        if self.timeout <= 0 or self.http_poll_interval <= 0:
+            raise ValueError('timeout and http_poll_interval must be positive')
+        self.stop_event = threading.Event()
+        self.thread = None
+        self.ser = None
         self.json_output = sds_dict.get('json_output', '/var/www/html/divumwx/jsondata/particles.txt')
         self.log_raw = to_bool(sds_dict.get('log_raw', False))
         
@@ -67,32 +77,65 @@ class NovaSDS011Service(StdService):
         self.last_update = None
         self.lock = threading.Lock()
         
-        # Serial connection
-        try:
-            self.ser = serial.Serial(
-                port=self.port,
-                baudrate=9600,
-                timeout=self.timeout
-            )
-            self.ser.flushInput()
-            log.info("%s connected on %s", DRIVER_NAME, self.port)
-        except Exception as e:
-            log.error("Could not open %s on %s: %s", DRIVER_NAME, self.port, e)
-            self.ser = None
-            return
-        
-        # Initialize sensor to query mode with retry logic
-        self.initialize_sensor()
-        
+        if not self.url:
+            # Serial connection
+            try:
+                self.ser = serial.Serial(
+                    port=self.port,
+                    baudrate=9600,
+                    timeout=self.timeout
+                )
+                self.ser.flushInput()
+                log.info("%s connected on %s", DRIVER_NAME, self.port)
+            except Exception as e:
+                log.error("Could not open %s on %s: %s", DRIVER_NAME, self.port, e)
+                self.ser = None
+                return
+            
+            # Initialize sensor to query mode with retry logic
+            self.initialize_sensor()
+            
         # Start background thread for read/sleep cycle
         self.running = True
-        self.thread = threading.Thread(target=self.sensor_loop, daemon=True)
+        self.thread = threading.Thread(target=self.http_loop if self.url else self.sensor_loop, daemon=True)
         self.thread.start()
         log.info("Started sensor loop: %ds read, %ds sleep", self.read_period, self.sleep_period)
         
         # Bind to loop packet events
         self.bind(weewx.NEW_LOOP_PACKET, self.new_loop_packet)
     
+    def query_http(self):
+        """Read particulate concentrations from a local Sensor.Community endpoint.
+
+        Returns:
+            tuple[float, float]: PM2.5 and PM10 in micrograms per cubic metre.
+        """
+        with urllib.request.urlopen(self.url, timeout=self.timeout) as response:
+            data = json.load(response)
+        values = {item['value_type']: float(item['value'])
+                  for item in data['sensordatavalues']
+                  if item.get('value_type') in ('SDS_P1', 'SDS_P2')}
+        if float(data.get('age', 0)) > 2 * self.http_poll_interval:
+            raise ValueError('Sensor.Community response is stale')
+        result = values['SDS_P2'], values['SDS_P1']
+        if any(not math.isfinite(value) or value < 0 for value in result):
+            raise ValueError('Invalid particulate concentration')
+        return result
+
+    def http_loop(self):
+        """Poll the configured HTTP endpoint until shutdown."""
+        while not self.stop_event.is_set():
+            try:
+                pm25, pm10 = self.query_http()
+                with self.lock:
+                    self.latest_pm25 = pm25
+                    self.latest_pm10 = pm10
+                    self.last_update = int(time.time())
+                self.write_json(self.last_update, pm25, pm10)
+            except (OSError, ValueError, KeyError, TypeError) as error:
+                log.warning('HTTP particulate read failed: %s', error)
+            self.stop_event.wait(self.http_poll_interval)
+
     def initialize_sensor(self):
         """Initialize sensor with retry logic."""
         max_retries = 3
@@ -234,6 +277,9 @@ class NovaSDS011Service(StdService):
     def new_loop_packet(self, event):
         """Add latest PM2.5 and PM10 values to loop packet."""
         with self.lock:
+            if self.url and (self.last_update is None or
+                    time.time() - self.last_update > 2 * self.http_poll_interval):
+                return
             if self.latest_pm25 is not None and self.latest_pm10 is not None:
                 event.packet['pm2_5'] = self.latest_pm25
                 event.packet['pm10_0'] = self.latest_pm10
@@ -270,6 +316,7 @@ class NovaSDS011Service(StdService):
         """Clean shutdown."""
         log.info("Shutting down %s service", DRIVER_NAME)
         self.running = False
+        self.stop_event.set()
         if self.thread and self.thread.is_alive():
             self.thread.join(timeout=5)
         if self.ser:

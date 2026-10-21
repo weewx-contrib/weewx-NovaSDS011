@@ -208,3 +208,27 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 ## 📧 Support
 
 For issues and questions, please use the [GitHub Issues](https://github.com/Millardiang/weewx-NovaSDS011/issues) page.
+
+## Local HTTP sensors
+
+On the `repair/sds011-http` branch, version 1.1.0 also accepts a
+Sensor.Community sensor's local JSON endpoint. Set these options in `[NovaSDS011]`:
+
+```ini
+    url = http://192.168.178.49/data.json
+    timeout = 3
+    http_poll_interval = 60
+```
+
+With `url` set, the service opens no serial port. It reads `SDS_P2` as PM2.5 and
+`SDS_P1` as PM10, in micrograms per cubic metre. Cached values expire after twice
+the polling interval. Responses older than that, negative values and non-finite
+concentrations are rejected. Shutdown interrupts the wait between HTTP polls.
+The configured `json_output` still controls the optional dashboard snapshot.
+
+This endpoint format differs from the remote Sensor.Community history and
+OpenSenseMap sensor APIs. Those response formats need separate adapters.
+
+Run `python -m pytest -q tests`. Tests use a local HTTP server, zero and invalid
+measurements, and a real pseudo-terminal for serial-open behavior. WeeWX 5.2
+already defines the `pm2_5`/`pm10_0` concentration units in every unit system.
